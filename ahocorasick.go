@@ -15,50 +15,34 @@ import (
 	"sync/atomic"
 )
 
-// A node in the trie structure used to implement Aho-Corasick
+// A node in the trie structure used to implement Aho-Corasick.
 type node struct {
-	root bool // true if this is the root
+	child  [256]*node // trie children, used only during construction
+	next   [256]*node // goto table: next[c] = node to transition to on byte c (nil = no match from root)
+	suffix *node
+	fail   *node
+	b      []byte
+	counter uint64
+	index   int
+	output  bool
+	root    bool
+}
 
-	b []byte // The blice at this node
-
-	output bool // True means this node represents a blice that should
-	// be output when matching
-	index int // index into original dictionary if output is true
-
-	counter uint64 // Set to the value of the Matcher.counter when a
-	// match is output to prevent duplicate output
-	// The use of fixed size arrays is space-inefficient but fast for
-	// lookups.
-
-	child [256]*node // A non-nil entry in this array means that the
-	// index represents a byte value which can be
-	// appended to the current node. Blices in the
-	// trie are built up byte by byte through these
-	// child node pointers.
-
-	fails [256]*node // Where to fail to (by following the fail
-	// pointers) for each possible byte
-
-	suffix *node // Pointer to the longest possible strict suffix of
-	// this node
-
-	fail *node // Pointer to the next node which is in the dictionary
-	// which can be reached from here following suffixes. Called fail
-	// because it is used to fallback in the trie when a match fails.
+// seenBuf wraps the deduplication slice for pooling, avoiding the need to
+// take the address of a local variable (which would cause it to escape to heap).
+type seenBuf struct {
+	s []uint64
 }
 
 // Matcher is returned by NewMatcher and contains a list of blices to
-// match against
+// match against.
 type Matcher struct {
-	counter uint64 // Counts the number of matches done, and is used to
-	// prevent output of multiple matches of the same string
-	trie []node // preallocated block of memory containing all the
-	// nodes
-	extent int   // offset into trie that is currently free
-	root   *node // Points to trie[0]
-
-	heap sync.Pool // a pool of haystacks to de-duplicate results in
-	// a thread-safe manner
+	heap    sync.Pool
+	root    *node
+	trie    []node
+	counter uint64
+	extent  int
+	dictLen int // number of patterns in the dictionary; bounds f.index
 }
 
 // findBlice looks for a blice in the trie starting from the root and
@@ -78,7 +62,7 @@ func (m *Matcher) findBlice(b []byte) *node {
 // getFreeNode: gets a free node structure from the Matcher's trie
 // pool and updates the extent to point to the next free node.
 func (m *Matcher) getFreeNode() *node {
-	m.extent += 1
+	m.extent++
 
 	if m.extent == 1 {
 		m.root = &m.trie[0]
@@ -96,11 +80,13 @@ func (m *Matcher) buildTrie(dictionary [][]byte) {
 	// are distinct plus the root). This is used to preallocate memory
 	// for it.
 
-	max := 1
+	m.dictLen = len(dictionary)
+
+	size := 1
 	for _, blice := range dictionary {
-		max += len(blice)
+		size += len(blice)
 	}
-	m.trie = make([]node, max)
+	m.trie = make([]node, size)
 
 	// Calling this an ignoring its argument simply allocated
 	// m.trie[0] which will be the root element
@@ -149,7 +135,7 @@ func (m *Matcher) buildTrie(dictionary [][]byte) {
 	l.PushBack(m.root)
 
 	for l.Len() > 0 {
-		n := l.Remove(l.Front()).(*node)
+		n, _ := l.Remove(l.Front()).(*node)
 
 		for i := 0; i < 256; i++ {
 			c := n.child[i]
@@ -178,22 +164,29 @@ func (m *Matcher) buildTrie(dictionary [][]byte) {
 		}
 	}
 
+	// Build the goto table: next[c] is the node to land on directly,
+	// collapsing the two-step fails[c] + child[c] into one lookup.
+	// All next entries must be computed before clearing any child arrays,
+	// because fail links point to lower-indexed nodes whose child arrays
+	// would otherwise already be cleared when we need them.
 	for i := 0; i < m.extent; i++ {
 		for c := 0; c < 256; c++ {
 			n := &m.trie[i]
 			for n.child[c] == nil && !n.root {
 				n = n.fail
 			}
-
-			m.trie[i].fails[c] = n
+			m.trie[i].next[c] = n.child[c]
 		}
+	}
+	for i := 0; i < m.extent; i++ {
+		m.trie[i].child = [256]*node{}
 	}
 
 	m.trie = m.trie[:m.extent]
 }
 
 // NewMatcher creates a new Matcher used to match against a set of
-// blices
+// blices.
 func NewMatcher(dictionary [][]byte) *Matcher {
 	m := new(Matcher)
 
@@ -203,7 +196,7 @@ func NewMatcher(dictionary [][]byte) *Matcher {
 }
 
 // NewStringMatcher creates a new Matcher used to match against a set
-// of strings (this is a helper to make initialization easy)
+// of strings (this is a helper to make initialization easy).
 func NewStringMatcher(dictionary []string) *Matcher {
 	m := new(Matcher)
 
@@ -217,91 +210,134 @@ func NewStringMatcher(dictionary []string) *Matcher {
 	return m
 }
 
+// MatchInto searches in for blices and appends the indexes of matched dictionary
+// entries into dst, returning the number of matches written. The caller may
+// reuse dst across calls to avoid allocations.
+//
+// This is not a thread-safe method; see MatchThreadSafeInto instead.
+func (m *Matcher) MatchInto(in []byte, dst []int) int {
+	m.counter++
+	before := len(dst)
+	dst = match(in, m.root, m.root, func(f *node) bool {
+		if f.counter != m.counter {
+			f.counter = m.counter
+			return true
+		}
+		return false
+	}, dst)
+	return len(dst) - before
+}
+
 // Match searches in for blices and returns all the blices found as indexes into
 // the original dictionary.
 //
 // This is not thread-safe method, seek for MatchThreadSafe() instead.
 func (m *Matcher) Match(in []byte) []int {
 	m.counter++
-
-	return match(in, m.root, func(f *node) bool {
+	return match(in, m.root, m.root, func(f *node) bool {
 		if f.counter != m.counter {
 			f.counter = m.counter
 			return true
 		}
 		return false
-	})
+	}, nil)
 }
 
 // match is a core of matching logic. Accepts input byte slice, starting node
-// and a func to check whether should we include result into response or not
-func match(in []byte, n *node, unique func(f *node) bool) []int {
-	var hits []int
-
+// and a func to check whether should we include result into response or not.
+// Results are appended to dst; the updated slice is returned.
+func match(in []byte, n *node, root *node, unique func(f *node) bool, dst []int) []int {
 	for _, b := range in {
-		c := int(b)
+		// next[c] is the pre-computed goto table: the node to transition to
+		// directly on byte c, following fail links as needed. nil means the
+		// root has no child for c, so reset to root and skip output checks.
+		f := n.next[int(b)]
+		if f == nil {
+			n = root
+			continue
+		}
+		n = f
 
-		if !n.root && n.child[c] == nil {
-			n = n.fails[c]
+		if f.output {
+			if unique(f) {
+				dst = append(dst, f.index)
+			}
 		}
 
-		if n.child[c] != nil {
-			f := n.child[c]
-			n = f
-
-			if f.output {
-				if unique(f) {
-					hits = append(hits, f.index)
-				}
-			}
-
-			for !f.suffix.root {
-				f = f.suffix
-				if unique(f) {
-					hits = append(hits, f.index)
-				} else {
-
-					// There's no point working our way up the
-					// suffixes if it's been done before for this call
-					// to Match. The matches are already in hits.
-
-					break
-				}
+		for !f.suffix.root {
+			f = f.suffix
+			if unique(f) {
+				dst = append(dst, f.index)
+			} else {
+				// There's no point working our way up the
+				// suffixes if it's been done before for this call
+				// to Match. The matches are already in hits.
+				break
 			}
 		}
 	}
 
-	return hits
+	return dst
 }
 
-// MatchThreadSafe provides the same result as Match() but does it in a
-// thread-safe manner. Uses a sync.Pool of haystacks to track the uniqueness of
-// the result items.
-func (m *Matcher) MatchThreadSafe(in []byte) []int {
-	var (
-		heap map[int]uint64
-	)
-
+// MatchThreadSafeInto searches in for blices and appends the indexes of matched
+// dictionary entries into dst, returning the number of matches written. The
+// caller may reuse dst across calls to avoid allocations.
+func (m *Matcher) MatchThreadSafeInto(in []byte, dst []int) int {
 	generation := atomic.AddUint64(&m.counter, 1)
 	n := m.root
-	// read the matcher's heap
-	item := m.heap.Get()
-	if item == nil {
-		heap = make(map[int]uint64, len(m.trie))
-	} else {
-		heap = item.(map[int]uint64)
-	}
 
-	hits := match(in, n, func(f *node) bool {
-		g := heap[f.index]
-		if g != generation {
-			heap[f.index] = generation
+	// Use a pooled *seenBuf indexed by dictionary index for O(1) deduplication
+	// without map overhead. Dictionary indexes are dense 0..dictLen-1.
+	// Pooling a *seenBuf (not *[]uint64) avoids taking the address of a local,
+	// which would cause the slice header to escape to heap on every call.
+	var buf *seenBuf
+	if item := m.heap.Get(); item != nil {
+		buf, _ = item.(*seenBuf)
+	}
+	if buf == nil {
+		buf = &seenBuf{s: make([]uint64, m.dictLen)}
+	}
+	seen := buf.s
+
+	before := len(dst)
+	dst = match(in, n, m.root, func(f *node) bool {
+		if seen[f.index] != generation {
+			seen[f.index] = generation
 			return true
 		}
 		return false
-	})
+	}, dst)
 
-	m.heap.Put(heap)
+	m.heap.Put(buf)
+	return len(dst) - before
+}
+
+// MatchThreadSafe provides the same result as Match() but does it in a
+// thread-safe manner. Uses a sync.Pool of seen-arrays to track the uniqueness
+// of the result items.
+func (m *Matcher) MatchThreadSafe(in []byte) []int {
+	generation := atomic.AddUint64(&m.counter, 1)
+	n := m.root
+
+	var buf *seenBuf
+	if item := m.heap.Get(); item != nil {
+		buf, _ = item.(*seenBuf)
+	}
+	if buf == nil {
+		buf = &seenBuf{s: make([]uint64, m.dictLen)}
+	}
+	seen := buf.s
+
+	hits := match(in, n, m.root, func(f *node) bool {
+		if seen[f.index] != generation {
+			seen[f.index] = generation
+			return true
+		}
+		return false
+	}, nil)
+
+	m.heap.Put(buf)
 	return hits
 }
 
@@ -310,22 +346,14 @@ func (m *Matcher) MatchThreadSafe(in []byte) []int {
 func (m *Matcher) Contains(in []byte) bool {
 	n := m.root
 	for _, b := range in {
-		c := int(b)
-		if !n.root {
-			n = n.fails[c]
+		f := n.next[int(b)]
+		if f == nil {
+			n = m.root
+			continue
 		}
-
-		if n.child[c] != nil {
-			f := n.child[c]
-			n = f
-
-			if f.output {
-				return true
-			}
-
-			for !f.suffix.root {
-				return true
-			}
+		n = f
+		if f.output || !f.suffix.root {
+			return true
 		}
 	}
 	return false

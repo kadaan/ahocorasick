@@ -1,0 +1,36 @@
+run:
+  timeout: 5m
+  relative-path-mode: gomod
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+
+  gocritic:
+    settings:
+      captLocal:
+        paramsOnly: false
+      underef:
+        skipRecvDeref: false
+
+  govet:
+    enable-all: true
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - errorlint
+    - gocritic
+    - godot
+    - gosec
+    - gosimple
+    - govet
+    - ineffassign
+    - perfsprint
+    - revive
+    - staticcheck
+    - unused
+
+issues:
+  max-same-issues: 50

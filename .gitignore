@@ -22,3 +22,9 @@ _testmain.go
 *.exe
 
 *~
+
+.DS_Store
+.devbox
+.claude/settings.local.json
+coverage.out
+ahocorasick.test

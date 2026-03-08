@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("Mozilla\x00Ma\x00011111\x00Mozilla1111\x00M0")
