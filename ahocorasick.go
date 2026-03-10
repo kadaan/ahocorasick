@@ -34,6 +34,16 @@ type seenBuf struct {
 	s []uint64
 }
 
+// Position records a single match occurrence with its location in the input.
+// Start and End are byte offsets using half-open [Start, End) intervals,
+// matching Go convention (regexp.FindAllIndex, slice notation).
+// The matched text can be extracted as in[pos.Start:pos.End].
+type Position struct {
+	Index int // 0-based index of the matched pattern in the dictionary
+	Start int // start byte offset in the input (inclusive)
+	End   int // end byte offset in the input (exclusive)
+}
+
 // Matcher is returned by NewMatcher and contains a list of blices to
 // match against.
 type Matcher struct {
@@ -211,21 +221,22 @@ func NewStringMatcher(dictionary []string) *Matcher {
 }
 
 // MatchInto searches in for blices and appends the indexes of matched dictionary
-// entries into dst, returning the number of matches written. The caller may
-// reuse dst across calls to avoid allocations.
+// entries into *dst, returning the number of matches written. The slice pointed
+// to by dst may be reallocated if its capacity is exceeded; the caller must use
+// the pointer (not a local copy) to observe any growth.
 //
 // This is not a thread-safe method; see MatchThreadSafeInto instead.
-func (m *Matcher) MatchInto(in []byte, dst []int) int {
+func (m *Matcher) MatchInto(in []byte, dst *[]int) int {
 	m.counter++
-	before := len(dst)
-	dst = match(in, m.root, m.root, func(f *node) bool {
+	before := len(*dst)
+	*dst = match(in, m.root, m.root, func(f *node) bool {
 		if f.counter != m.counter {
 			f.counter = m.counter
 			return true
 		}
 		return false
-	}, dst)
-	return len(dst) - before
+	}, *dst)
+	return len(*dst) - before
 }
 
 // Match searches in for blices and returns all the blices found as indexes into
@@ -281,9 +292,10 @@ func match(in []byte, n *node, root *node, unique func(f *node) bool, dst []int)
 }
 
 // MatchThreadSafeInto searches in for blices and appends the indexes of matched
-// dictionary entries into dst, returning the number of matches written. The
-// caller may reuse dst across calls to avoid allocations.
-func (m *Matcher) MatchThreadSafeInto(in []byte, dst []int) int {
+// dictionary entries into *dst, returning the number of matches written. The
+// slice pointed to by dst may be reallocated if its capacity is exceeded; the
+// caller must use the pointer (not a local copy) to observe any growth.
+func (m *Matcher) MatchThreadSafeInto(in []byte, dst *[]int) int {
 	generation := atomic.AddUint64(&m.counter, 1)
 	n := m.root
 
@@ -300,17 +312,17 @@ func (m *Matcher) MatchThreadSafeInto(in []byte, dst []int) int {
 	}
 	seen := buf.s
 
-	before := len(dst)
-	dst = match(in, n, m.root, func(f *node) bool {
+	before := len(*dst)
+	*dst = match(in, n, m.root, func(f *node) bool {
 		if seen[f.index] != generation {
 			seen[f.index] = generation
 			return true
 		}
 		return false
-	}, dst)
+	}, *dst)
 
 	m.heap.Put(buf)
-	return len(dst) - before
+	return len(*dst) - before
 }
 
 // MatchThreadSafe provides the same result as Match() but does it in a
@@ -339,6 +351,73 @@ func (m *Matcher) MatchThreadSafe(in []byte) []int {
 
 	m.heap.Put(buf)
 	return hits
+}
+
+// matchPositions is the core position-aware matching logic. It reports every
+// occurrence of every pattern (no deduplication), appending Position values to
+// dst and returning the updated slice.
+func matchPositions(in []byte, n *node, root *node, dst []Position) []Position {
+	for i, b := range in {
+		f := n.next[int(b)]
+		if f == nil {
+			n = root
+			continue
+		}
+		n = f
+		if f.output {
+			dst = append(dst, Position{
+				Index: f.index,
+				Start: i + 1 - len(f.b),
+				End:   i + 1,
+			})
+		}
+		for !f.suffix.root {
+			f = f.suffix
+			dst = append(dst, Position{
+				Index: f.index,
+				Start: i + 1 - len(f.b),
+				End:   i + 1,
+			})
+		}
+	}
+	return dst
+}
+
+// MatchPositions searches in for blices and returns all match occurrences,
+// including repeated occurrences of the same pattern. Each Position records
+// the dictionary index and the [Start, End) byte offsets in in.
+//
+// This is not a thread-safe method; see MatchPositionsThreadSafe instead.
+func (m *Matcher) MatchPositions(in []byte) []Position {
+	return matchPositions(in, m.root, m.root, nil)
+}
+
+// MatchPositionsInto searches in for blices and appends match occurrences into
+// *dst, returning the number of matches written. The slice pointed to by dst
+// may be reallocated if its capacity is exceeded; the caller must use the
+// pointer (not a local copy) to observe any growth.
+//
+// This is not a thread-safe method; see MatchPositionsThreadSafeInto instead.
+func (m *Matcher) MatchPositionsInto(in []byte, dst *[]Position) int {
+	before := len(*dst)
+	*dst = matchPositions(in, m.root, m.root, *dst)
+	return len(*dst) - before
+}
+
+// MatchPositionsThreadSafe provides the same result as MatchPositions but is
+// safe for concurrent use. Since no deduplication state is written, all four
+// MatchPositions variants delegate to the same internal function.
+func (m *Matcher) MatchPositionsThreadSafe(in []byte) []Position {
+	return matchPositions(in, m.root, m.root, nil)
+}
+
+// MatchPositionsThreadSafeInto provides the same result as MatchPositionsInto
+// but is safe for concurrent use. The slice pointed to by dst may be
+// reallocated if its capacity is exceeded.
+func (m *Matcher) MatchPositionsThreadSafeInto(in []byte, dst *[]Position) int {
+	before := len(*dst)
+	*dst = matchPositions(in, m.root, m.root, *dst)
+	return len(*dst) - before
 }
 
 // Contains returns true if any string matches. This can be faster
